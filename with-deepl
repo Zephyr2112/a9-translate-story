@@ -27,7 +27,8 @@
     })();
 
     // --- CẤU HÌNH DEEPL ---
-    const DEEPL_API_KEY = 'd65d2ca0-9fb1-4070-9890-61ae8446eda7:fx';
+    // --- copy mã API để trong dấu ngoặc thay YOUR_API_KEY ---
+    const DEEPL_API_KEY = 'YOUR_API_KEY';
     const DEEPL_GLOSSARY_ID = 'a3d85b66-3986-4274-ab48-2acfa7b74e9e'; // để trống '' nếu không dùng glossary
 
     const MAX_CACHE_SIZE = 500;
