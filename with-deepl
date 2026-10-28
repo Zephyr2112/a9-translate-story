@@ -1,24 +1,36 @@
-
-
 // ==UserScript==
-// @name         Arknights Story - Dịch song ngữ Việt (DeepL + Bing + GGTrans)
+// @name         Arknights Story - Dịch song ngữ Việt (DeepL + GGTrans)
 // @namespace    khoa.arknights.translate
-// @version      9.0
-// @description  Tự động dịch câu thoại (DeepL), tên người nói (Bing), sticker, lựa chọn hội thoại, và tiêu đề chương sang tiếng Việt
-// @match        https://arknights.timo.beer/story.html*
+// @version      10.6
+// @description  Tự động dịch câu thoại, tên người nói, sticker, lựa chọn hội thoại, tiêu đề chương, và chế độ đọc cuộn sang tiếng Việt (DeepL, dự phòng Google)
+// @match        https://arknights.timo.beer/*
 // @grant        GM_xmlhttpRequest
 // @connect      api-free.deepl.com
 // @connect      translate.googleapis.com
-// @connect      edge.microsoft.com
-// @connect      api-edge.cognitive.microsofttranslator.com
 // @connect      fonts.googleapis.com
 // @connect      fonts.gstatic.com
 // ==/UserScript==
 
+/*
+ * v10.0 — sửa cho giao diện mới (10/2026):
+ *  - Web giờ là SPA, URL dạng /main/chapter-17/17-1 (không còn story.html)
+ *    -> @match đổi thành toàn bộ trang, observer chạy ngay khi script nạp.
+ *  - Nút lựa chọn: lấy chữ từ .vn-decision-label (bỏ số thứ tự .vn-decision-key).
+ *  - Tiêu đề: web ghi đè innerHTML của #vnTitle -> tự gắn lại bản dịch khi bị xoá.
+ *  - MỚI: hỗ trợ chế độ đọc cuộn (#vnScroll .vn-scroll-line), chỉ dịch dòng đang hiện trên màn hình.
+ * v10.1:
+ *  - Bỏ Bing: cổng lấy token edge.microsoft.com/translate/auth đã ngừng (404) nên tên người nói
+ *    không được dịch. Tên giờ dịch bằng DeepL (dùng chung glossary), dự phòng Google.
+ *  - Không lưu cache khi dịch lỗi, để lần sau còn thử lại.
+ */
+
 (function () {
     'use strict';
 
-    // --- NẠP FONT TIẾNG VIỆT ĐẸP CHO TIÊU ĐỀ ---
+    // --- NẠP FONT TIẾNG VIỆT ---
+    // Be Vietnam Pro: tiêu đề chương
+    const VI_FONT_FAMILY = 'Roboto Condensed VI';
+
     (function loadFont() {
         const link = document.createElement('link');
         link.rel = 'stylesheet';
@@ -26,13 +38,40 @@
         document.head.appendChild(link);
     })();
 
+    // Roboto Condensed: đúng font gốc của web, nhưng web chỉ nạp phần chữ Latin (không có dấu Việt).
+    // Nạp bản đầy đủ từ Google Fonts dưới một TÊN RIÊNG ("Roboto Condensed VI"),
+    // để có đủ dấu tiếng Việt mà không đụng tới font của web.
+    (function loadVietCondensed() {
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: 'https://fonts.googleapis.com/css2?family=Roboto+Condensed:wght@400;500;700&display=swap',
+            onload: (res) => {
+                const css = (res.responseText || '')
+                    .replace(/font-family:\s*'Roboto Condensed'/g, `font-family: '${VI_FONT_FAMILY}'`);
+                if (!css.includes(VI_FONT_FAMILY)) return; // tải lỗi -> dùng font dự phòng
+                const style = document.createElement('style');
+                style.id = 'vnViFontFace';
+                style.textContent = css;
+                document.head.appendChild(style);
+            }
+        });
+    })();
+
     // --- CẤU HÌNH DEEPL ---
-    // --- copy mã API để trong dấu ngoặc thay YOUR_API_KEY ---
     const DEEPL_API_KEY = 'YOUR_API_KEY';
     const DEEPL_GLOSSARY_ID = 'a3d85b66-3986-4274-ab48-2acfa7b74e9e'; // để trống '' nếu không dùng glossary
 
-    const MAX_CACHE_SIZE = 500;
+    const VI_COLOR = '#ffd479';
+    // Lời thoại, sticker, lựa chọn và tên người nói đều dùng Roboto Condensed (bản có dấu Việt),
+    // giống font gốc mà lại gọn chỗ. Nếu chưa tải được thì tạm dùng Segoe UI / Arial.
+    const VI_FONT = `"${VI_FONT_FAMILY}", "Segoe UI", Arial, sans-serif`;
+    const VI_NAME_FONT = VI_FONT;
+
+    const TRANSLATE_ERROR = '(Lỗi dịch)';
+    const MAX_CACHE_SIZE = 1000;
     const cache = new Map();
+    const nameCache = new Map(); // cache riêng cho tên người nói
+    const pendingNames = new Map(); // tên đang chờ dịch -> danh sách callback
 
     // Viết hoa chữ cái đầu mỗi từ, xử lý đúng ký tự "đ" của tiếng Việt
     function toTitleCase(str) {
@@ -57,6 +96,11 @@
             .trim();
     }
 
+    // Gom khoảng trắng / xuống dòng thành 1 dấu cách
+    function cleanText(str) {
+        return (str || '').replace(/\s+/g, ' ').trim();
+    }
+
     function setCache(key, value) {
         if (cache.size >= MAX_CACHE_SIZE) {
             const firstKey = cache.keys().next().value;
@@ -66,7 +110,7 @@
     }
 
     // --- HÀM DỊCH THUẬT CHÍNH (dùng cho câu thoại/sticker/decisions/tiêu đề) ---
-    function translateText(text, speakerName = '', type = 'text', callback) {
+    function translateText(text, type, callback) {
         if (!text || text === '...' || text === '......') {
             callback('');
             return;
@@ -79,50 +123,40 @@
         }
 
         translateWithDeepL(text, type, (translated) => {
-            setCache(cacheKey, translated);
+            // không lưu kết quả lỗi, để lần sau còn thử dịch lại
+            if (translated && translated !== TRANSLATE_ERROR) setCache(cacheKey, translated);
             callback(translated);
         });
     }
 
     function translateWithDeepL(text, type, callback, retryCount = 0) {
-        const url = 'https://api-free.deepl.com/v2/translate';
-
         const requestBody = {
             text: [text],
             source_lang: 'EN',
             target_lang: 'VI'
         };
-
-        if (DEEPL_GLOSSARY_ID) {
-            requestBody.glossary_id = DEEPL_GLOSSARY_ID;
-        }
+        if (DEEPL_GLOSSARY_ID) requestBody.glossary_id = DEEPL_GLOSSARY_ID;
 
         GM_xmlhttpRequest({
             method: 'POST',
-            url: url,
+            url: 'https://api-free.deepl.com/v2/translate',
             headers: {
                 'Authorization': `DeepL-Auth-Key ${DEEPL_API_KEY}`,
                 'Content-Type': 'application/json'
             },
             data: JSON.stringify(requestBody),
             timeout: 10000,
-            ontimeout: () => {
-                retryDeepL('Timeout', text, type, callback, retryCount);
-            },
+            ontimeout: () => retryDeepL('Timeout', text, type, callback, retryCount),
             onload: (res) => {
                 try {
                     const json = JSON.parse(res.responseText);
                     if (json.message) throw new Error('DeepL error: ' + json.message);
-                    let translated = json.translations[0].text.trim();
-                    translated = stripForeignScripts(translated);
-                    callback(translated);
+                    callback(stripForeignScripts(json.translations[0].text.trim()));
                 } catch (e) {
                     retryDeepL(e.message, text, type, callback, retryCount);
                 }
             },
-            onerror: () => {
-                retryDeepL('Mất kết nối', text, type, callback, retryCount);
-            }
+            onerror: () => retryDeepL('Mất kết nối', text, type, callback, retryCount)
         });
     }
 
@@ -135,15 +169,12 @@
             onload: (res) => {
                 try {
                     const json = JSON.parse(res.responseText);
-                    const translated = json[0].map(part => part[0]).join('');
-                    callback(stripForeignScripts(translated));
+                    callback(stripForeignScripts(json[0].map(part => part[0]).join('')));
                 } catch (e) {
-                    callback('(Lỗi dịch)');
+                    callback(TRANSLATE_ERROR);
                 }
             },
-            onerror: () => {
-                callback('(Lỗi dịch)');
-            }
+            onerror: () => callback(TRANSLATE_ERROR)
         });
     }
 
@@ -151,87 +182,53 @@
         const MAX_RETRIES = 2;
         if (retryCount < MAX_RETRIES) {
             console.warn(`[Arknights Dịch] DeepL lỗi (${errorMsg}), thử lại lần ${retryCount + 1}`);
-            setTimeout(() => {
-                translateWithDeepL(text, type, callback, retryCount + 1);
-            }, 1500);
+            setTimeout(() => translateWithDeepL(text, type, callback, retryCount + 1), 1500);
         } else {
             console.warn(`[Arknights Dịch] DeepL lỗi sau ${MAX_RETRIES} lần thử (${errorMsg}), chuyển sang Google Translate`);
             translateWithGoogleGTX(text, callback);
         }
     }
 
-    // --- TẦNG BING (dùng riêng cho tên người nói) ---
-    let bingAuthToken = null;
-    let bingAuthTokenTime = 0;
-
-    function getBingAuthToken(callback) {
-        const now = Date.now();
-        if (bingAuthToken && now - bingAuthTokenTime < 7 * 60 * 1000) {
-            callback(bingAuthToken);
+    // --- DỊCH TÊN NGƯỜI NÓI ---
+    // Trước đây dùng Bing, nhưng cổng lấy token của Bing đã ngừng (404).
+    // Giờ dùng DeepL (cùng glossary với câu thoại nên tên nhân vật khớp nhau), dự phòng Google.
+    // Trả về chuỗi "(Tên Việt)", hoặc '' nếu tên giữ nguyên / dịch lỗi.
+    function translateName(rawName, callback) {
+        if (!rawName || rawName === '???') {
+            callback('');
             return;
         }
-        GM_xmlhttpRequest({
-            method: 'GET',
-            url: 'https://edge.microsoft.com/translate/auth',
-            onload: (res) => {
-                if (res.responseText && res.responseText.length > 1) {
-                    bingAuthToken = res.responseText;
-                    bingAuthTokenTime = Date.now();
-                    callback(bingAuthToken);
-                } else {
-                    callback(null);
-                }
-            },
-            onerror: () => callback(null)
-        });
-    }
+        if (nameCache.has(rawName)) {
+            callback(nameCache.get(rawName));
+            return;
+        }
+        // Tên này đang được dịch dở -> chờ chung kết quả, không gửi thêm request
+        if (pendingNames.has(rawName)) {
+            pendingNames.get(rawName).push(callback);
+            return;
+        }
+        pendingNames.set(rawName, [callback]);
 
-    function translateWithBing(text, callback, retryCount = 0) {
-        getBingAuthToken((token) => {
-            if (!token) {
-                if (retryCount < 1) {
-                    setTimeout(() => translateWithBing(text, callback, retryCount + 1), 1000);
-                } else {
-                    callback(text); // nếu thất bại, giữ nguyên tên gốc
-                }
-                return;
+        translateText(rawName, 'name', (translated) => {
+            const waiting = pendingNames.get(rawName) || [];
+            pendingNames.delete(rawName);
+
+            let result = '';
+            if (translated && translated !== TRANSLATE_ERROR) {
+                const cleaned = translated.replace(/[.。]+$/, '').trim(); // bỏ dấu chấm cuối nếu có
+                result = cleaned.toLowerCase() === rawName.toLowerCase()
+                    ? ''
+                    : `(${toTitleCase(cleaned)})`;
+                nameCache.set(rawName, result);
             }
-            GM_xmlhttpRequest({
-                method: 'POST',
-                url: 'https://api-edge.cognitive.microsofttranslator.com/translate?api-version=3.0&includeSentenceLength=true&to=vi&from=en',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'authorization': 'Bearer ' + token
-                },
-                data: JSON.stringify([{ text: text }]),
-                timeout: 10000,
-                onload: (res) => {
-                    try {
-                        const json = JSON.parse(res.responseText);
-                        const translated = json[0].translations[0].text.trim();
-                        callback(stripForeignScripts(translated));
-                    } catch (e) {
-                        if (retryCount < 1) {
-                            bingAuthToken = null; // token có thể đã hết hạn, buộc lấy lại
-                            setTimeout(() => translateWithBing(text, callback, retryCount + 1), 1000);
-                        } else {
-                            callback(text);
-                        }
-                    }
-                },
-                onerror: () => {
-                    if (retryCount < 1) {
-                        setTimeout(() => translateWithBing(text, callback, retryCount + 1), 1000);
-                    } else {
-                        callback(text);
-                    }
-                }
-            });
+            // lỗi: không hiện gì, và không lưu cache để lần sau thử lại
+            waiting.forEach(cb => cb(result));
         });
     }
 
     // --- QUẢN LÝ DOM: CÂU THOẠI ---
     function ensureTranslationBox() {
+        const dialogBox = document.getElementById('vnDialogBox');
         let box = document.getElementById('vnViText');
         if (!box) {
             box = document.createElement('div');
@@ -240,37 +237,80 @@
         margin-top: 6px;
         padding-top: 6px;
         border-top: 1px solid rgba(255,255,255,0.25);
-        color: #ffd479;
-        font-family: "Noto Sans", "Segoe UI", "Roboto", "Helvetica Neue", Arial, sans-serif;
+        color: ${VI_COLOR};
+        font-family: ${VI_FONT};
         font-size: 0.95em;
         line-height: 1.5;
       `;
-            const dialogBox = document.getElementById('vnDialogBox');
-            if (dialogBox) dialogBox.appendChild(box);
         }
+        // gắn lại nếu chưa nằm trong khung thoại (web có thể dựng lại khung khi chuyển màn)
+        if (dialogBox && box.parentNode !== dialogBox) dialogBox.appendChild(box);
+        syncTextLayout(box);
         return box;
     }
 
+    // Khung thoại của web là dạng lưới (grid), và đổi bố cục theo cỡ màn hình / cài đặt
+    // (màn rộng: tên 1 cột bên trái, lời thoại cột bên phải). Nếu không chỉ định cột,
+    // dòng dịch sẽ bị xếp nhầm vào cột tên hẹp. Nên: đặt dòng dịch vào ĐÚNG cột của #vnText.
+    function syncTextLayout(box) {
+        const textEl = document.getElementById('vnText');
+        if (!box || !textEl) return;
+        const cs = getComputedStyle(textEl);
+        const layout = {
+            gridColumn: `${cs.gridColumnStart} / ${cs.gridColumnEnd}`,
+            justifySelf: cs.justifySelf,
+            maxWidth: cs.maxWidth,
+            textAlign: cs.textAlign
+        };
+        // chỉ ghi khi khác, tránh ghi lại style liên tục
+        Object.keys(layout).forEach(key => {
+            if (box.style[key] !== layout[key]) box.style[key] = layout[key];
+        });
+    }
+
+    // Đổi cỡ cửa sổ / bật tắt toàn màn hình -> web đổi bố cục -> canh lại
+    window.addEventListener('resize', () => {
+        const box = document.getElementById('vnViText');
+        if (box) syncTextLayout(box);
+    });
+
     // --- QUẢN LÝ DOM: TÊN NGƯỜI NÓI ---
+    // Tên dịch được đặt BÊN TRONG #vnSpeakerName, xuống dòng ngay dưới tên gốc,
+    // cỡ chữ bằng 1 nửa. Vì nằm trong cùng phần tử nên tự theo canh lề của tên gốc
+    // (màn rộng canh phải, màn hẹp canh trái). Web ghi đè innerHTML của #vnSpeakerName
+    // mỗi câu, nên giữ sẵn 1 span và gắn lại khi bị xoá.
+    let speakerSpan = null;
+
     function ensureSpeakerSpan() {
-        let span = document.getElementById('vnViSpeaker');
-        if (!span) {
-            span = document.createElement('span');
-            span.id = 'vnViSpeaker';
-            span.style.cssText = `
-        margin-left: 8px;
-        font-family: "Noto Sans", "Segoe UI", "Roboto", "Helvetica Neue", Arial, sans-serif;
-        font-weight: 500;
-        font-size: 0.85em;
-        color: #e0e0e0;
+        const speakerEl = document.getElementById('vnSpeakerName');
+        if (!speakerSpan) {
+            speakerSpan = document.createElement('span');
+            speakerSpan.id = 'vnViSpeaker';
+            speakerSpan.style.cssText = `
+        display: block;
+        margin-top: 0.35em;
+        font-family: ${VI_NAME_FONT};
+        font-size: 0.75em;
+        font-weight: 700;
+        line-height: 1.2;
+        letter-spacing: 0.02em;
+        color: ${VI_COLOR};
         opacity: 0.9;
       `;
-            const speakerEl = document.getElementById('vnSpeakerName');
-            if (speakerEl && speakerEl.parentNode) {
-                speakerEl.parentNode.insertBefore(span, speakerEl.nextSibling);
-            }
         }
-        return span;
+        if (speakerEl && speakerSpan.parentNode !== speakerEl) {
+            speakerEl.appendChild(speakerSpan);
+        }
+        return speakerSpan;
+    }
+
+    // Lấy tên gốc, bỏ qua phần tên dịch mà script đã chèn vào
+    function getRawSpeaker(speakerEl) {
+        let text = '';
+        speakerEl.childNodes.forEach(node => {
+            if (node.id !== 'vnViSpeaker') text += node.textContent;
+        });
+        return cleanText(text);
     }
 
     // --- QUẢN LÝ DOM: TIÊU ĐỀ CHƯƠNG ---
@@ -286,21 +326,13 @@
         font-weight: 900;
         font-size: 0.4em;
         letter-spacing: 0.02em;
-        color: #ffd479;
+        color: ${VI_COLOR};
         opacity: 0.9;
         margin-top: 8px;
       `;
-            titleEl.appendChild(span);
         }
+        if (span.parentNode !== titleEl) titleEl.appendChild(span);
         return span;
-    }
-
-    function debounce(func, wait) {
-        let timeout;
-        return function (...args) {
-            clearTimeout(timeout);
-            timeout = setTimeout(() => func.apply(this, args), wait);
-        };
     }
 
     // --- XỬ LÝ CÂU THOẠI ---
@@ -310,12 +342,13 @@
     let currentTextRequestId = 0;
 
     const handleTextChange = (textEl) => {
-        const text = textEl.textContent.trim();
+        const text = cleanText(textEl.textContent);
         const box = ensureTranslationBox();
 
         if (!text || text === '...' || text === '......') {
             box.textContent = '';
             lastTextLength = 0;
+            lastTranslatedText = '';
             return;
         }
 
@@ -330,15 +363,12 @@
             box.textContent = 'Đang dịch...';
             const requestId = ++currentTextRequestId;
 
-            translateText(text, '', 'text', (translated) => {
-                if (requestId === currentTextRequestId) {
-                    box.textContent = translated;
-                }
+            translateText(text, 'text', (translated) => {
+                if (requestId === currentTextRequestId) box.textContent = translated;
             });
         };
 
         clearTimeout(typingTimer);
-
         if (diff > 2) {
             executeTranslate();
         } else {
@@ -346,37 +376,54 @@
         }
     };
 
-    // --- XỬ LÝ TÊN NGƯỜI NÓI (dùng Bing) ---
-    const handleSpeakerChange = debounce((speakerEl) => {
-        const rawSpeaker = speakerEl.textContent.trim();
+    // --- XỬ LÝ TÊN NGƯỜI NÓI ---
+    // Chỉ ghi khi nội dung thật sự khác, để việc chèn span không tự kích hoạt
+    // MutationObserver thêm lần nữa (tránh vòng lặp vô hạn).
+    function setSpeakerTranslation(speakerEl, result) {
+        if (!result) {
+            if (speakerSpan && speakerSpan.parentNode) speakerSpan.remove();
+            return;
+        }
         const span = ensureSpeakerSpan();
+        if (span.textContent !== result) span.textContent = result;
+    }
+
+    // Không debounce: web xoá tên dịch mỗi câu, nên gắn lại ngay để không bị nháy
+    function handleSpeakerChange(speakerEl) {
+        const rawSpeaker = getRawSpeaker(speakerEl);
 
         if (!rawSpeaker || rawSpeaker === '???') {
-            span.textContent = '';
+            setSpeakerTranslation(speakerEl, '');
             return;
         }
 
-        translateWithBing(rawSpeaker, (translated) => {
-            if (translated.toLowerCase() === rawSpeaker.toLowerCase()) {
-                span.textContent = '';
-            } else {
-                span.textContent = `(${toTitleCase(translated)})`;
-            }
+        // Tên đã dịch rồi -> gắn lại ngay
+        if (nameCache.has(rawSpeaker)) {
+            setSpeakerTranslation(speakerEl, nameCache.get(rawSpeaker));
+            return;
+        }
+
+        // Tên mới -> bỏ tên dịch cũ (tránh hiện nhầm tên người trước) rồi chờ dịch
+        setSpeakerTranslation(speakerEl, '');
+        translateName(rawSpeaker, (result) => {
+            // chỉ ghi nếu người nói chưa đổi trong lúc chờ
+            if (getRawSpeaker(speakerEl) === rawSpeaker) setSpeakerTranslation(speakerEl, result);
         });
-    }, 150);
+    }
 
     // --- XỬ LÝ STICKER TRÊN CANVAS ---
     function processStickers() {
         const stickers = document.querySelectorAll('#vnCanvas .vn-sticker:not([data-vi-translated="1"])');
         stickers.forEach(el => {
-            const text = el.textContent.trim();
+            const text = cleanText(el.textContent);
             if (!text) return;
 
             el.dataset.viTranslated = '1';
-            translateText(text, '', 'text', (translated) => {
-                if (translated.toLowerCase() === text.toLowerCase()) return;
+            translateText(text, 'text', (translated) => {
+                if (!translated || translated.toLowerCase() === text.toLowerCase()) return;
                 const span = document.createElement('span');
-                span.style.cssText = 'display:block; font-family: "Noto Sans", "Segoe UI", Arial, sans-serif; font-size: 0.8em; opacity: 0.85; color: #ffd479;';
+                span.className = 'vi-sticker-tr';
+                span.style.cssText = `display:block; font-family: ${VI_FONT}; font-size: 0.8em; opacity: 0.85; color: ${VI_COLOR};`;
                 span.textContent = translated;
                 el.appendChild(span);
             });
@@ -387,65 +434,155 @@
     function processDecisions() {
         const buttons = document.querySelectorAll('#vnDecisions .vn-decision-btn:not([data-vi-translated="1"])');
         buttons.forEach(btn => {
-            let text = btn.textContent.trim();
-            if (!text) return;
-
-            // Lọc bỏ số thứ tự (1, 2, 2., v.v.) bị dính vào đầu chuỗi do nằm chung khung với nút bấm
-            text = text.replace(/^\d+\.?\s*/, '');
+            // giao diện mới: chữ nằm trong .vn-decision-label, số thứ tự nằm riêng trong .vn-decision-key
+            const labelEl = btn.querySelector('.vn-decision-label');
+            let text = labelEl
+                ? cleanText(labelEl.textContent)
+                : cleanText(btn.textContent).replace(/^\d+\.?\s*/, '');
             if (!text) return;
 
             btn.dataset.viTranslated = '1';
-            translateText(text, '', 'text', (translated) => {
-                if (translated.toLowerCase() === text.toLowerCase()) return;
+            translateText(text, 'text', (translated) => {
+                if (!translated || translated.toLowerCase() === text.toLowerCase()) return;
                 const span = document.createElement('span');
-                span.style.cssText = 'display:block; font-family: "Noto Sans", "Segoe UI", Arial, sans-serif; font-size: 0.8em; opacity: 0.8; color: #ffd479; margin-top: 4px;';
+                span.className = 'vi-decision-tr';
+                span.style.cssText = `display:block; font-family: ${VI_FONT}; font-size: 0.8em; opacity: 0.8; color: ${VI_COLOR}; margin-top: 4px;`;
                 span.textContent = translated;
-                btn.appendChild(span);
+                (labelEl || btn).appendChild(span);
             });
         });
     }
 
     // --- XỬ LÝ TIÊU ĐỀ CHƯƠNG ---
     let lastSeenTitle = '';
+    let lastTitleTranslation = '';
 
     function processTitle() {
         const titleEl = document.getElementById('vnTitle');
         if (!titleEl) return;
 
         const viSpan = document.getElementById('vnViTitle');
-        const text = viSpan
-            ? titleEl.textContent.replace(viSpan.textContent, '').trim()
-            : titleEl.textContent.trim();
+        const spanInside = viSpan && viSpan.parentNode === titleEl;
+        const text = cleanText(spanInside
+            ? titleEl.textContent.replace(viSpan.textContent, '')
+            : titleEl.textContent);
 
-        if (!text || text === lastSeenTitle) return;
+        if (!text) return;
+
+        // Cùng tiêu đề: web có thể đã xoá span của mình (innerHTML bị ghi đè) -> gắn lại
+        if (text === lastSeenTitle) {
+            if (!spanInside && lastTitleTranslation) {
+                const span = ensureTitleTranslationSpan();
+                if (span) span.textContent = lastTitleTranslation;
+            }
+            return;
+        }
+
         lastSeenTitle = text;
+        lastTitleTranslation = '';
 
-        translateText(text, '', 'text', (translated) => {
+        translateText(text, 'text', (translated) => {
+            if (text !== lastSeenTitle) return; // tiêu đề đã đổi trong lúc chờ
             const span = ensureTitleTranslationSpan();
             if (!span) return;
-            if (translated.toLowerCase() === text.toLowerCase()) {
-                span.textContent = '';
-            } else {
-                span.textContent = translated;
+            lastTitleTranslation = translated.toLowerCase() === text.toLowerCase() ? '' : translated;
+            span.textContent = lastTitleTranslation;
+        });
+    }
+
+    // --- CHẾ ĐỘ ĐỌC CUỘN (MỚI) ---
+    // Chỉ dịch những dòng đang hiện trên màn hình để tiết kiệm quota DeepL.
+    const MAX_PARALLEL = 3;
+    let running = 0;
+    const queue = [];
+
+    // Hàm báo "xong 1 việc" — khai báo ngoài vòng lặp để tránh lỗi eslint no-loop-func
+    function onJobDone() {
+        running--;
+        runQueue();
+    }
+
+    function runQueue() {
+        while (running < MAX_PARALLEL && queue.length) {
+            const job = queue.shift();
+            running++;
+            job(onJobDone);
+        }
+    }
+
+    function translateScrollLine(line) {
+        if (line.dataset.viTranslated === '1') return;
+        line.dataset.viTranslated = '1';
+
+        const body = line.querySelector('.vn-scroll-body');
+        if (!body) return;
+
+        // Tên người nói
+        const nameEl = body.querySelector('.vn-scroll-name');
+        if (nameEl && !nameEl.querySelector('.vi-scroll-name')) {
+            const raw = cleanText(nameEl.textContent);
+            translateName(raw, (result) => {
+                if (!result) return;
+                const s = document.createElement('span');
+                s.className = 'vi-scroll-name';
+                s.style.cssText = `display: block; margin-top: 0.2em; font-family: ${VI_NAME_FONT}; font-size: 0.75em; font-weight: 700; line-height: 1.2; letter-spacing: 0.02em; color: ${VI_COLOR}; opacity: 0.9;`;
+                s.textContent = result;
+                nameEl.appendChild(s);
+            });
+        }
+
+        // Câu thoại
+        const paras = [...body.querySelectorAll('p')];
+        const text = cleanText(paras.map(p => p.textContent).join(' '));
+        if (!text || text === '...' || text === '......') return;
+
+        queue.push((done) => {
+            translateText(text, 'text', (translated) => {
+                if (translated && translated.toLowerCase() !== text.toLowerCase()) {
+                    const div = document.createElement('div');
+                    div.className = 'vi-scroll-tr';
+                    div.style.cssText = `margin-top: 4px; color: ${VI_COLOR}; font-family: ${VI_FONT}; font-size: 0.95em; line-height: 1.5;`;
+                    div.textContent = translated;
+                    body.appendChild(div);
+                }
+                done();
+            });
+        });
+        runQueue();
+    }
+
+    const scrollIO = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                scrollIO.unobserve(entry.target);
+                translateScrollLine(entry.target);
             }
         });
+    }, { rootMargin: '300px 0px' }); // dịch trước một chút khi sắp cuộn tới
+
+    function processScrollLines() {
+        document
+            .querySelectorAll('#vnScroll .vn-scroll-line:not([data-vi-watch="1"])')
+            .forEach(line => {
+                line.dataset.viWatch = '1';
+                scrollIO.observe(line);
+            });
     }
 
     // --- KHỞI TẠO OBSERVER ---
     function initObserver() {
-        const targetNode = document.body;
-        const config = { childList: true, subtree: true, characterData: true };
-
         const observer = new MutationObserver((mutations) => {
             let shouldUpdateText = false;
             let shouldUpdateSpeaker = false;
             let shouldUpdateCanvas = false;
             let shouldUpdateDecisions = false;
             let shouldUpdateTitle = false;
+            let shouldUpdateScroll = false;
 
             for (const mutation of mutations) {
-                const target = mutation.target.nodeType === Node.TEXT_NODE ? mutation.target.parentElement : mutation.target;
-
+                const target = mutation.target.nodeType === Node.TEXT_NODE
+                    ? mutation.target.parentElement
+                    : mutation.target;
                 if (!target || !target.closest) continue;
 
                 if (target.closest('#vnText')) shouldUpdateText = true;
@@ -453,6 +590,7 @@
                 if (target.closest('#vnCanvas')) shouldUpdateCanvas = true;
                 if (target.closest('#vnDecisions')) shouldUpdateDecisions = true;
                 if (target.closest('#vnTitle')) shouldUpdateTitle = true;
+                if (target.closest('#vnScroll') && mutation.addedNodes.length) shouldUpdateScroll = true;
             }
 
             if (shouldUpdateText) {
@@ -463,25 +601,28 @@
                 const speakerEl = document.getElementById('vnSpeakerName');
                 if (speakerEl) handleSpeakerChange(speakerEl);
             }
-            if (shouldUpdateCanvas) {
-                processStickers();
-            }
-            if (shouldUpdateDecisions) {
-                processDecisions();
-            }
-            if (shouldUpdateTitle) {
-                processTitle();
-            }
+            if (shouldUpdateCanvas) processStickers();
+            if (shouldUpdateDecisions) processDecisions();
+            if (shouldUpdateTitle) processTitle();
+            if (shouldUpdateScroll) processScrollLines();
         });
 
-        observer.observe(targetNode, config);
+        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
     }
 
-    window.addEventListener('load', () => {
-        setTimeout(() => {
-            initObserver();
-            processTitle();
-        }, 200);
-    });
-})();
+    // Web giờ là SPA (chuyển trang không tải lại), nên khởi động ngay
+    // thay vì chờ sự kiện 'load' (có thể đã qua mất khi script được nạp).
+    function start() {
+        initObserver();
+        processTitle();
+        processStickers();
+        processDecisions();
+        processScrollLines();
+    }
 
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start);
+    } else {
+        start();
+    }
+})();
