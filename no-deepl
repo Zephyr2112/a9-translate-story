@@ -1,27 +1,22 @@
 // ==UserScript==
-// @name         Arknights Story - Dịch song ngữ Việt (DeepL + GGTrans)
-// @namespace    khoa.arknights.translate
-// @version      10.6
-// @description  Tự động dịch câu thoại, tên người nói, sticker, lựa chọn hội thoại, tiêu đề chương, và chế độ đọc cuộn sang tiếng Việt (DeepL, dự phòng Google)
+// @name         Arknights Story - Dịch song ngữ Việt (Google Translate)
+// @namespace    khoa.arknights.translate.google
+// @version      10.6-gg
+// @description  Tự động dịch câu thoại, tên người nói, sticker, lựa chọn hội thoại, tiêu đề chương, và chế độ đọc cuộn sang tiếng Việt — chỉ dùng Google Translate, không cần API key
 // @match        https://arknights.timo.beer/*
 // @grant        GM_xmlhttpRequest
-// @connect      api-free.deepl.com
 // @connect      translate.googleapis.com
 // @connect      fonts.googleapis.com
 // @connect      fonts.gstatic.com
 // ==/UserScript==
 
 /*
- * v10.0 — sửa cho giao diện mới (10/2026):
- *  - Web giờ là SPA, URL dạng /main/chapter-17/17-1 (không còn story.html)
- *    -> @match đổi thành toàn bộ trang, observer chạy ngay khi script nạp.
- *  - Nút lựa chọn: lấy chữ từ .vn-decision-label (bỏ số thứ tự .vn-decision-key).
- *  - Tiêu đề: web ghi đè innerHTML của #vnTitle -> tự gắn lại bản dịch khi bị xoá.
- *  - MỚI: hỗ trợ chế độ đọc cuộn (#vnScroll .vn-scroll-line), chỉ dịch dòng đang hiện trên màn hình.
- * v10.1:
- *  - Bỏ Bing: cổng lấy token edge.microsoft.com/translate/auth đã ngừng (404) nên tên người nói
- *    không được dịch. Tên giờ dịch bằng DeepL (dùng chung glossary), dự phòng Google.
- *  - Không lưu cache khi dịch lỗi, để lần sau còn thử lại.
+ * Bản CHỈ DÙNG GOOGLE TRANSLATE, tách ra từ bản DeepL v10.6.
+ *  - Không cần API key, không giới hạn quota như DeepL Free.
+ *  - Không có glossary: tên riêng/thuật ngữ có thể dịch khác bản DeepL.
+ *  - Giao diện (vị trí, font, cỡ chữ, chế độ đọc cuộn...) giữ y hệt bản v10.6.
+ *
+ * LƯU Ý: đừng bật cùng lúc với bản DeepL trong Tampermonkey, nếu không sẽ hiện 2 dòng dịch.
  */
 
 (function () {
@@ -56,10 +51,6 @@
             }
         });
     })();
-
-    // --- CẤU HÌNH DEEPL ---
-    const DEEPL_API_KEY = 'YOUR_API_KEY';
-    const DEEPL_GLOSSARY_ID = 'a3d85b66-3986-4274-ab48-2acfa7b74e9e'; // để trống '' nếu không dùng glossary
 
     const VI_COLOR = '#ffd479';
     // Lời thoại, sticker, lựa chọn và tên người nói đều dùng Roboto Condensed (bản có dấu Việt),
@@ -109,7 +100,7 @@
         cache.set(key, value);
     }
 
-    // --- HÀM DỊCH THUẬT CHÍNH (dùng cho câu thoại/sticker/decisions/tiêu đề) ---
+    // --- HÀM DỊCH THUẬT CHÍNH (dùng cho câu thoại/tên/sticker/decisions/tiêu đề) ---
     function translateText(text, type, callback) {
         if (!text || text === '...' || text === '......') {
             callback('');
@@ -122,76 +113,56 @@
             return;
         }
 
-        translateWithDeepL(text, type, (translated) => {
+        translateWithGoogle(text, (translated) => {
             // không lưu kết quả lỗi, để lần sau còn thử dịch lại
             if (translated && translated !== TRANSLATE_ERROR) setCache(cacheKey, translated);
             callback(translated);
         });
     }
 
-    function translateWithDeepL(text, type, callback, retryCount = 0) {
-        const requestBody = {
-            text: [text],
-            source_lang: 'EN',
-            target_lang: 'VI'
+    // --- GOOGLE TRANSLATE (endpoint GTX miễn phí, không cần key) ---
+    const GOOGLE_MAX_RETRIES = 2;
+
+    function translateWithGoogle(text, callback, retryCount = 0) {
+        const url = 'https://translate.googleapis.com/translate_a/single'
+            + `?client=gtx&sl=en&tl=vi&dt=t&q=${encodeURIComponent(text)}`;
+
+        const retry = (reason) => {
+            if (retryCount < GOOGLE_MAX_RETRIES) {
+                console.warn(`[Arknights Dịch] Google lỗi (${reason}), thử lại lần ${retryCount + 1}`);
+                // chờ lâu dần: 1s, 2s — tránh bị Google chặn vì gọi dồn dập
+                setTimeout(() => translateWithGoogle(text, callback, retryCount + 1), 1000 * (retryCount + 1));
+            } else {
+                console.warn(`[Arknights Dịch] Google lỗi sau ${GOOGLE_MAX_RETRIES} lần thử (${reason})`);
+                callback(TRANSLATE_ERROR);
+            }
         };
-        if (DEEPL_GLOSSARY_ID) requestBody.glossary_id = DEEPL_GLOSSARY_ID;
 
-        GM_xmlhttpRequest({
-            method: 'POST',
-            url: 'https://api-free.deepl.com/v2/translate',
-            headers: {
-                'Authorization': `DeepL-Auth-Key ${DEEPL_API_KEY}`,
-                'Content-Type': 'application/json'
-            },
-            data: JSON.stringify(requestBody),
-            timeout: 10000,
-            ontimeout: () => retryDeepL('Timeout', text, type, callback, retryCount),
-            onload: (res) => {
-                try {
-                    const json = JSON.parse(res.responseText);
-                    if (json.message) throw new Error('DeepL error: ' + json.message);
-                    callback(stripForeignScripts(json.translations[0].text.trim()));
-                } catch (e) {
-                    retryDeepL(e.message, text, type, callback, retryCount);
-                }
-            },
-            onerror: () => retryDeepL('Mất kết nối', text, type, callback, retryCount)
-        });
-    }
-
-    // Tầng dự phòng: Google Translate GTX, miễn phí không cần key
-    function translateWithGoogleGTX(text, callback) {
-        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=vi&dt=t&q=${encodeURIComponent(text)}`;
         GM_xmlhttpRequest({
             method: 'GET',
             url: url,
+            timeout: 10000,
+            ontimeout: () => retry('Timeout'),
+            onerror: () => retry('Mất kết nối'),
             onload: (res) => {
+                if (res.status && res.status !== 200) {
+                    retry('HTTP ' + res.status); // 429 = gọi quá nhiều
+                    return;
+                }
                 try {
                     const json = JSON.parse(res.responseText);
-                    callback(stripForeignScripts(json[0].map(part => part[0]).join('')));
+                    // Google cắt câu dài thành nhiều đoạn -> ghép lại
+                    const translated = json[0].map(part => part[0] || '').join('');
+                    callback(stripForeignScripts(translated.trim()));
                 } catch (e) {
-                    callback(TRANSLATE_ERROR);
+                    retry(e.message);
                 }
-            },
-            onerror: () => callback(TRANSLATE_ERROR)
+            }
         });
     }
 
-    function retryDeepL(errorMsg, text, type, callback, retryCount) {
-        const MAX_RETRIES = 2;
-        if (retryCount < MAX_RETRIES) {
-            console.warn(`[Arknights Dịch] DeepL lỗi (${errorMsg}), thử lại lần ${retryCount + 1}`);
-            setTimeout(() => translateWithDeepL(text, type, callback, retryCount + 1), 1500);
-        } else {
-            console.warn(`[Arknights Dịch] DeepL lỗi sau ${MAX_RETRIES} lần thử (${errorMsg}), chuyển sang Google Translate`);
-            translateWithGoogleGTX(text, callback);
-        }
-    }
-
     // --- DỊCH TÊN NGƯỜI NÓI ---
-    // Trước đây dùng Bing, nhưng cổng lấy token của Bing đã ngừng (404).
-    // Giờ dùng DeepL (cùng glossary với câu thoại nên tên nhân vật khớp nhau), dự phòng Google.
+    // Dùng Google Translate như câu thoại.
     // Trả về chuỗi "(Tên Việt)", hoặc '' nếu tên giữ nguyên / dịch lỗi.
     function translateName(rawName, callback) {
         if (!rawName || rawName === '???') {
@@ -491,7 +462,7 @@
     }
 
     // --- CHẾ ĐỘ ĐỌC CUỘN (MỚI) ---
-    // Chỉ dịch những dòng đang hiện trên màn hình để tiết kiệm quota DeepL.
+    // Chỉ dịch những dòng đang hiện trên màn hình, tránh gọi Google dồn dập rồi bị chặn tạm thời.
     const MAX_PARALLEL = 3;
     let running = 0;
     const queue = [];
